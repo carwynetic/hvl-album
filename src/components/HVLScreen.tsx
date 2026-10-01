@@ -920,6 +920,8 @@ export function HVLScreen() {
   const isDetailMinimizedRef = useRef(false);
   const handleNextTrackRef = useRef<() => void>(() => {});
   const audioRef = useRef<HTMLAudioElement>(null);
+  const preloadAudioRef = useRef<HTMLAudioElement | null>(null);
+  const hasTransitionedRef = useRef(false);
   const isSeekingRef = useRef(false);
   const resumeAfterSeekRef = useRef(false);
   const audioSeekRequestRef = useRef(0);
@@ -1568,25 +1570,29 @@ export function HVLScreen() {
       audioSeekRequestRef.current += 1;
       isSeekingRef.current = false;
       resumeAfterSeekRef.current = false;
-      setIsSeeking(false);
+      hasTransitionedRef.current = false;
       const audio = audioRef.current;
       const track = galleryItems[textureIndex];
       const isTrackStreamPreview = track?.type === "stream" && !track.audioUrl;
       if (audio) {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.removeAttribute("src");
-
         if (track?.audioUrl) {
-          audio.src = track.audioUrl;
-          audio.load();
+          const expectedSrc = new URL(track.audioUrl, window.location.href).href;
+          if (audio.src !== expectedSrc) {
+            audio.src = track.audioUrl;
+          }
+          audio.currentTime = 0;
         } else {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.removeAttribute("src");
           audio.load();
         }
       }
-      setIsPlaying(false);
+      if (!track?.audioUrl) {
+        setIsPlaying(false);
+      }
       setCurrentTime(0);
-      setDuration(0);
+      setDuration(track?.durationSeconds ?? 0);
       setAutoNextRemaining(streamDisplayDelay);
       setStreamElapsedTime(0);
       setStreamTimerRevision((revision) => revision + 1);
@@ -1675,6 +1681,22 @@ export function HVLScreen() {
   useEffect(() => {
     handleNextTrackRef.current = handleNextTrack;
   }, [handleNextTrack]);
+
+  useEffect(() => {
+    if (!nextTrackResult?.track?.audioUrl) return;
+    const nextUrl = nextTrackResult.track.audioUrl;
+
+    const preloader = new Audio();
+    preloader.preload = "auto";
+    preloader.src = nextUrl;
+    preloader.load();
+    preloadAudioRef.current = preloader;
+
+    return () => {
+      preloader.src = "";
+      preloadAudioRef.current = null;
+    };
+  }, [nextTrackResult?.track?.audioUrl]);
 
   const handleNextButtonClick = useCallback((presentation?: TrackPresentation) => {
     playClickSound();
@@ -1892,13 +1914,33 @@ export function HVLScreen() {
       }
 
       audio.currentTime = 0;
+      hasTransitionedRef.current = false;
       void audio.play().catch(() => setIsPlaying(false));
       return;
     }
 
-    setIsPlaying(false);
+    hasTransitionedRef.current = false;
     handleNextTrack();
   }, [handleNextTrack, repeatMode, selectedTrack]);
+
+  const handleTimeUpdate = useCallback((event: React.SyntheticEvent<HTMLAudioElement>) => {
+    const currentAudio = event.currentTarget;
+    setCurrentTime(currentAudio.currentTime);
+
+    // Smooth gapless auto-transition: when reaching near the end of track (within 0.12s of duration)
+    // and actively playing without seeking, transition immediately without waiting for empty buffer delay
+    if (
+      currentAudio.duration > 0 &&
+      currentAudio.currentTime >= currentAudio.duration - 0.12 &&
+      !currentAudio.paused &&
+      !currentAudio.seeking &&
+      !isSeekingRef.current &&
+      !hasTransitionedRef.current
+    ) {
+      hasTransitionedRef.current = true;
+      handleTrackEnded();
+    }
+  }, [handleTrackEnded]);
 
   const handlePlayPause = useCallback(async () => {
     const audio = audioRef.current;
@@ -2503,10 +2545,13 @@ export function HVLScreen() {
 
       <audio
         ref={audioRef}
-        preload="metadata"
+        preload="auto"
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
-        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-        onSeeked={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onTimeUpdate={handleTimeUpdate}
+        onSeeked={(event) => {
+          hasTransitionedRef.current = false;
+          setCurrentTime(event.currentTarget.currentTime);
+        }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onEnded={handleTrackEnded}
