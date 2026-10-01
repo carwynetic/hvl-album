@@ -245,7 +245,7 @@ export function HVLTrackDetail(props: Record<string, unknown>) {
               )}
             </button>
           )}
-          {!isDetailMinimized && selectedTrack?.type === "pulled" && (!isMobile || (!isLyricsOpen && !isSongAnnotationOpen)) && (
+          {!isDetailMinimized && (selectedTrack?.type === "pulled" || Boolean(selectedTrack?.lyrics)) && (!isMobile || (!isLyricsOpen && !isSongAnnotationOpen)) && (
             <button
               className="detail-lyrics-button"
               type="button"
@@ -255,7 +255,7 @@ export function HVLTrackDetail(props: Record<string, unknown>) {
               {isLyricsOpen ? <ListXIcon /> : <ListMusicIcon />}
             </button>
           )}
-          {!isDetailMinimized && selectedTrack?.type === "pulled" && (
+          {!isDetailMinimized && (selectedTrack?.type === "pulled" || Boolean(selectedTrack?.lyrics)) && (
             <button
               className="detail-lyrics-fullscreen-button"
               type="button"

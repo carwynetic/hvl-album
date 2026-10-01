@@ -4,18 +4,28 @@ import NextImage from "next/image";
 import { Loader } from "@react-three/drei";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  aiMoiLaKeXauXaLyrics,
   anhKhongMuonNoDeDangLyrics,
+  babyLyrics,
   camOnLyrics,
   chePhuLyrics,
+  daoCuaAnhVuaLyrics,
   duaChuaLyrics,
   envyLyrics,
   ghetXogLaiThikLyrics,
+  huhLyrics,
   hutVaHutLyrics,
   idkLyrics,
   intepolLyrics,
+  khongCanLoChoTaoLyrics,
   laGiCuaNhauLyrics,
   liemLyrics,
+  matMoiTayChanLyrics,
+  motCaiOmLyrics,
+  neuNhuTaChangConLyrics,
+  nguyenVanMuoiLyrics,
   nhinKeThuTaoLyrics,
+  nightInPragueLyrics,
   oanhMThuocLyrics,
   slipperyLyrics,
   tayThiLyrics,
@@ -197,6 +207,7 @@ const galleryItems: readonly GalleryItem[] = (
     pMobileBackground: "right",
     audioUrl: "/music/baby.mp3?v=0133-0148",
     type: "stream",
+    ...babyLyrics,
   },
   {
     numberTrack: 6,
@@ -250,6 +261,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.6,
     audioUrl: "/music/mat-moi-tay-chan.mp3",
     type: "stream",
+    ...matMoiTayChanLyrics,
   },
   {
     numberTrack: 8,
@@ -259,6 +271,7 @@ const galleryItems: readonly GalleryItem[] = (
     imageUrl: "/images/dao-cua-anh-vua.png",
     audioUrl: "/music/dao-cua-anh-vua.mp3?v=0013-8-0037-6",
     type: "stream",
+    ...daoCuaAnhVuaLyrics,
   },
   {
     numberTrack: 9,
@@ -288,6 +301,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.35,
     audioUrl: "/music/night-in-prague.mp3",
     type: "stream",
+    ...nightInPragueLyrics,
   },
   {
     numberTrack: 11,
@@ -298,6 +312,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.6,
     audioUrl: "/music/mot-cai-om.mp3?v=0100-0126-7",
     type: "stream",
+    ...motCaiOmLyrics,
   },
   {
     numberTrack: 12,
@@ -327,6 +342,7 @@ const galleryItems: readonly GalleryItem[] = (
     pMobileBackground: "right",
     audioUrl: "/music/neu-nhu-ta-chang-con.mp3?v=0109-0130",
     type: "stream",
+    ...neuNhuTaChangConLyrics,
   },
   {
     numberTrack: 14,
@@ -337,6 +353,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.6,
     audioUrl: "/music/ai-moi-la-ke-xau-xa.mp3?v=0158-0225",
     type: "stream",
+    ...aiMoiLaKeXauXaLyrics,
   },
   {
     numberTrack: 15,
@@ -507,6 +524,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.35,
     audioUrl: "/music/khong-can-lo-cho-tao.mp3?v=0113-0133-2",
     type: "stream",
+    ...khongCanLoChoTaoLyrics,
   },
   {
     numberTrack: 28,
@@ -517,6 +535,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.35,
     audioUrl: "/music/huh.mp3?v=0321-0334",
     type: "stream",
+    ...huhLyrics,
   },
   {
     numberTrack: 29,
@@ -527,6 +546,7 @@ const galleryItems: readonly GalleryItem[] = (
     bMobileBackground: 0.6,
     audioUrl: "/music/nguyen-van-muoi.mp3",
     type: "stream",
+    ...nguyenVanMuoiLyrics,
   },
   {
     numberTrack: 30,
@@ -1575,10 +1595,10 @@ export function HVLScreen() {
       setDetailNavigationPreview(null);
       const nextPresentation = presentation ?? (isDetailMinimizedRef.current ? "minimized" : "detail");
       const shouldRestoreLyrics = keepLyricsOpen || lyricsShouldReopenRef.current;
-      const shouldOpenLyrics = track?.type === "pulled"
+      const shouldOpenLyrics = (track?.type === "pulled" || Boolean(track?.lyrics))
         && nextPresentation === "detail"
         && shouldRestoreLyrics;
-      lyricsShouldReopenRef.current = track?.type === "stream"
+      lyricsShouldReopenRef.current = track?.type === "stream" && !track?.lyrics
         ? keepLyricsOpen || lyricsShouldReopenRef.current
         : Boolean(shouldOpenLyrics);
       setIsLyricsClosing(false);
