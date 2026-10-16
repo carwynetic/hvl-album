@@ -580,6 +580,8 @@ const displayModeStorageKey = "hvl-display-mode";
 const displayStyleStorageKey = "hvl-display-style";
 const dockPinnedStorageKey = "hvl-dock-pinned";
 const mobileDockModeStorageKey = "hvl-mobile-dock-mode";
+const volumeStorageKey = "hvl-player-volume";
+const mutedStorageKey = "hvl-player-muted";
 const desktopSidePanelTransitionDuration = 420;
 const mobileSidePanelTransitionDuration = 500;
 
@@ -902,6 +904,11 @@ export function HVLScreen() {
   const [isFloatingPlayerExpanded, setIsFloatingPlayerExpanded] = useState(true);
   const [repeatToastMessage, setRepeatToastMessage] = useState<string | null>(null);
   const [repeatToastPlacement, setRepeatToastPlacement] = useState<"detail" | "dock">("dock");
+  const [volume, setVolume] = useState(0.85);
+  const [isMuted, setIsMuted] = useState(false);
+  const lastNonZeroVolumeRef = useRef(0.85);
+  const volumeRef = useRef(0.85);
+  const isMutedRef = useRef(false);
 
   const closeOverlayTimeoutRef = useRef<number | null>(null);
   const detailMinimizeTimeoutRef = useRef<number | null>(null);
@@ -1641,6 +1648,8 @@ export function HVLScreen() {
       setSelectedProject({ name: projectName, imageUrl, index: textureIndex });
       setShowOverlay(true);
       if (track?.audioUrl && audio) {
+        audio.volume = isMutedRef.current ? 0 : volumeRef.current;
+        audio.muted = isMutedRef.current;
         void audio.play().catch(() => setIsPlaying(false));
       }
       if (isMobile) {
@@ -1689,6 +1698,8 @@ export function HVLScreen() {
     const preloader = new Audio();
     preloader.preload = "auto";
     preloader.src = nextUrl;
+    preloader.volume = isMuted ? 0 : volume;
+    preloader.muted = isMuted;
     preloader.load();
     preloadAudioRef.current = preloader;
 
@@ -1696,7 +1707,60 @@ export function HVLScreen() {
       preloader.src = "";
       preloadAudioRef.current = null;
     };
-  }, [nextTrackResult?.track?.audioUrl]);
+  }, [nextTrackResult?.track?.audioUrl, volume, isMuted]);
+
+  const handleVolumeChange = useCallback((newVolume: number) => {
+    const clamped = Math.max(0, Math.min(1, newVolume));
+    setVolume(clamped);
+    volumeRef.current = clamped;
+    if (clamped > 0) {
+      lastNonZeroVolumeRef.current = clamped;
+      setIsMuted(false);
+      isMutedRef.current = false;
+      window.localStorage.setItem(mutedStorageKey, "false");
+    }
+    window.localStorage.setItem(volumeStorageKey, clamped.toString());
+
+    if (audioRef.current) {
+      audioRef.current.volume = clamped;
+      audioRef.current.muted = clamped === 0;
+    }
+    if (preloadAudioRef.current) {
+      preloadAudioRef.current.volume = clamped;
+      preloadAudioRef.current.muted = clamped === 0;
+    }
+  }, []);
+
+  const handleToggleMute = useCallback(() => {
+    if (isMuted || volume === 0) {
+      const restored = lastNonZeroVolumeRef.current > 0 ? lastNonZeroVolumeRef.current : 0.85;
+      setIsMuted(false);
+      isMutedRef.current = false;
+      setVolume(restored);
+      volumeRef.current = restored;
+      window.localStorage.setItem(mutedStorageKey, "false");
+      window.localStorage.setItem(volumeStorageKey, restored.toString());
+      if (audioRef.current) {
+        audioRef.current.muted = false;
+        audioRef.current.volume = restored;
+      }
+      if (preloadAudioRef.current) {
+        preloadAudioRef.current.muted = false;
+        preloadAudioRef.current.volume = restored;
+      }
+    } else {
+      lastNonZeroVolumeRef.current = volume > 0 ? volume : 0.85;
+      setIsMuted(true);
+      isMutedRef.current = true;
+      window.localStorage.setItem(mutedStorageKey, "true");
+      if (audioRef.current) {
+        audioRef.current.muted = true;
+      }
+      if (preloadAudioRef.current) {
+        preloadAudioRef.current.muted = true;
+      }
+    }
+  }, [isMuted, volume]);
 
   const handleNextButtonClick = useCallback((presentation?: TrackPresentation) => {
     playClickSound();
@@ -2246,6 +2310,35 @@ export function HVLScreen() {
       setIsDockPinned(storedDockPinned === "true");
     }
 
+    const storedVolume = window.localStorage.getItem(volumeStorageKey);
+    const storedMuted = window.localStorage.getItem(mutedStorageKey);
+
+    let initialVolume = 0.85;
+    let initialMuted = false;
+
+    if (storedVolume !== null) {
+      const parsed = parseFloat(storedVolume);
+      if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+        initialVolume = parsed;
+        if (parsed > 0) {
+          lastNonZeroVolumeRef.current = parsed;
+        }
+      }
+    }
+
+    if (storedMuted === "true") {
+      initialMuted = true;
+    }
+
+    setVolume(initialVolume);
+    volumeRef.current = initialVolume;
+    setIsMuted(initialMuted);
+    isMutedRef.current = initialMuted;
+
+    if (audioRef.current) {
+      audioRef.current.volume = initialMuted ? 0 : initialVolume;
+      audioRef.current.muted = initialMuted;
+    }
   }, []);
 
   useEffect(() => {
@@ -2546,7 +2639,11 @@ export function HVLScreen() {
       <audio
         ref={audioRef}
         preload="auto"
-        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
+        onLoadedMetadata={(event) => {
+          setDuration(event.currentTarget.duration);
+          event.currentTarget.volume = isMutedRef.current ? 0 : volumeRef.current;
+          event.currentTarget.muted = isMutedRef.current;
+        }}
         onTimeUpdate={handleTimeUpdate}
         onSeeked={(event) => {
           hasTransitionedRef.current = false;
@@ -2807,6 +2904,10 @@ export function HVLScreen() {
         finishProgressSeek,
         cancelProgressSeek,
         StreamingPlatformLinks,
+        volume,
+        isMuted,
+        handleVolumeChange,
+        handleToggleMute,
       }} />
 
       {isSettingsOpen && (

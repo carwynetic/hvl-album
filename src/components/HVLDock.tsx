@@ -1,6 +1,7 @@
 "use client";
 
 import NextImage from "next/image";
+import { HVLVolumeControl } from "./HVLVolumeControl";
 
 function formatTime(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -11,6 +12,10 @@ function formatTime(seconds: number) {
 
 export function HVLDock(props: Record<string, unknown>) {
   const {
+    volume,
+    isMuted,
+    handleVolumeChange,
+    handleToggleMute,
     selectedProject,
     isDetailMinimized,
     isDockVisible,
@@ -75,37 +80,48 @@ export function HVLDock(props: Record<string, unknown>) {
             <span style={{ width: `${dockPlaybackProgress}%` }} />
           </span>
           <div className="floating-player__layout">
-            <div
-              className="floating-player__track"
-              onClick={(event) => {
-                event.stopPropagation();
-                handleRestoreProject();
-              }}
-            >
-              <span className={`floating-player__art ${!isStreaming && isPlaying ? "is-playing" : ""}`}>
-                <NextImage
-                  src={selectedTrack.imageUrl}
-                  alt=""
-                  width={64}
-                  height={64}
-                  sizes="64px"
-                  unoptimized
+            <div className="floating-player__left">
+              <div
+                className="floating-player__track"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleRestoreProject();
+                }}
+              >
+                <span className={`floating-player__art ${!isStreaming && isPlaying ? "is-playing" : ""}`}>
+                  <NextImage
+                    src={selectedTrack.imageUrl}
+                    alt=""
+                    width={64}
+                    height={64}
+                    sizes="64px"
+                    unoptimized
+                  />
+                </span>
+                <span className="floating-player__copy">
+                  <span className="floating-player__track-label">
+                    {getTrackLabel(selectedTrack.numberTrack)}
+                    {!isStreaming && (
+                      <span className="floating-player__mobile-track-time">
+                        {" / "}{formatTime(dockCurrentTime)} - {formatTime(dockDuration)}
+                      </span>
+                    )}
+                  </span>
+                  <span className="floating-player__next-copy">
+                    <span className="floating-player__next-title">{selectedTrack.title}</span>
+                    <span className="floating-player__next-artist">{selectedTrack.subtitle}</span>
+                  </span>
+                </span>
+              </div>
+
+              {!isStreamTrack && (
+                <HVLVolumeControl
+                  volume={typeof volume === "number" ? volume : 0.85}
+                  isMuted={Boolean(isMuted)}
+                  onVolumeChange={handleVolumeChange}
+                  onToggleMute={handleToggleMute}
                 />
-              </span>
-              <span className="floating-player__copy">
-                <span className="floating-player__track-label">
-                  {getTrackLabel(selectedTrack.numberTrack)}
-                  {!isStreaming && (
-                    <span className="floating-player__mobile-track-time">
-                      {" / "}{formatTime(dockCurrentTime)} - {formatTime(dockDuration)}
-                    </span>
-                  )}
-                </span>
-                <span className="floating-player__next-copy">
-                  <span className="floating-player__next-title">{selectedTrack.title}</span>
-                  <span className="floating-player__next-artist">{selectedTrack.subtitle}</span>
-                </span>
-              </span>
+              )}
             </div>
 
             <div
