@@ -46,6 +46,12 @@ import { HVLCanvas } from "./HVLCanvas";
 import { HVLTrackDetail } from "./HVLTrackDetail";
 import { HVLDock } from "./HVLDock";
 import { assetPath } from "../utils/path";
+import {
+  getAudioFileName,
+  getEffectiveTrackBounds,
+  getTrackAudioTrim,
+  SILENT_WAV_DATA_URI,
+} from "./audio-trim";
 
 
 type GalleryItemSeed = Omit<GalleryItem, "pMobileBackground" | "bMobileBackground"> & Partial<Pick<GalleryItem, "pMobileBackground" | "bMobileBackground">>;
@@ -599,10 +605,6 @@ function formatFileSize(bytes: number | null) {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function getAudioFileName(audioUrl: string) {
-  return audioUrl.split("?")[0].split("/").pop()?.toLowerCase() ?? "audio.mp3";
-}
-
 function formatTrackNumber(numberTrack: number) {
   return numberTrack.toString().padStart(2, "0");
 }
@@ -882,6 +884,7 @@ export function HVLScreen() {
   const [isSeeking, setIsSeeking] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [schedulerNonce, setSchedulerNonce] = useState(0);
   const [isAgeGateOpen, setIsAgeGateOpen] = useState(false);
   const [isAgeGateStateReady, setIsAgeGateStateReady] = useState(false);
   const [hasConfirmedAge, setHasConfirmedAge] = useState(false);
@@ -926,8 +929,21 @@ export function HVLScreen() {
   const mobileScrollTopRef = useRef(0);
   const isDetailMinimizedRef = useRef(false);
   const handleNextTrackRef = useRef<() => void>(() => {});
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const preloadAudioRef = useRef<HTMLAudioElement | null>(null);
+  const handleTrackEndedRef = useRef<() => void>(() => {});
+  const deckARef = useRef<HTMLAudioElement>(null);
+  const deckBRef = useRef<HTMLAudioElement>(null);
+  const activeDeckIndexRef = useRef<0 | 1>(0);
+  const unlockedDecksRef = useRef<[boolean, boolean]>([false, false]);
+  const standbyCuedRef = useRef<{ expectedSrc: string; trimStart: number; ready: boolean } | null>(null);
+  const fadingDeckRef = useRef<HTMLAudioElement | null>(null);
+  const outgoingFadeCleanupRef = useRef<(() => void) | null>(null);
+  const standbyCueTimeoutRef = useRef<number | null>(null);
+  const activeStartSeekCleanupRef = useRef<(() => void) | null>(null);
+  const transitionTimerRef = useRef<number | null>(null);
+  const transitionRafRef = useRef<number | null>(null);
+  const trackSwitchIdRef = useRef(0);
+  const selectedTrackRef = useRef<GalleryItem | null>(null);
+  const repeatModeRef = useRef<RepeatMode>("off");
   const hasTransitionedRef = useRef(false);
   const isSeekingRef = useRef(false);
   const resumeAfterSeekRef = useRef(false);
@@ -942,6 +958,248 @@ export function HVLScreen() {
     lastY: number;
     hasDragged: boolean;
   } | null>(null);
+
+  const getDeckAudio = useCallback((index: 0 | 1) => (
+    index === 0 ? deckARef.current : deckBRef.current
+  ), []);
+
+  const getStandbyDeckIndex = useCallback((): 0 | 1 => (
+    activeDeckIndexRef.current === 0 ? 1 : 0
+  ), []);
+
+  const getActiveAudio = useCallback(() => (
+    getDeckAudio(activeDeckIndexRef.current)
+  ), [getDeckAudio]);
+
+  const getStandbyAudio = useCallback(() => (
+    getDeckAudio(activeDeckIndexRef.current === 0 ? 1 : 0)
+  ), [getDeckAudio]);
+
+  const fadeOutAndPauseDeck = useCallback((outgoing: HTMLAudioElement | null, durationMs = 35) => {
+    outgoingFadeCleanupRef.current?.();
+    if (!outgoing || outgoing.paused) return;
+
+    const targetVolume = isMutedRef.current ? 0 : volumeRef.current;
+    if (durationMs <= 0 || outgoing.muted || outgoing.volume <= 0.001) {
+      outgoing.pause();
+      outgoing.volume = targetVolume;
+      return;
+    }
+
+    fadingDeckRef.current = outgoing;
+    const startVolume = outgoing.volume;
+    const startAt = performance.now();
+    let rafId: number | null = null;
+    let fallbackTimeout: number | null = null;
+    let finished = false;
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (rafId != null) window.cancelAnimationFrame(rafId);
+      if (fallbackTimeout != null) window.clearTimeout(fallbackTimeout);
+      outgoing.pause();
+      outgoing.volume = isMutedRef.current ? 0 : volumeRef.current;
+      if (fadingDeckRef.current === outgoing) {
+        fadingDeckRef.current = null;
+      }
+      if (outgoingFadeCleanupRef.current === finish) {
+        outgoingFadeCleanupRef.current = null;
+      }
+    };
+
+    outgoingFadeCleanupRef.current = finish;
+
+    const tick = () => {
+      if (finished) return;
+      const progress = Math.min(1, (performance.now() - startAt) / durationMs);
+      outgoing.volume = Math.max(0, startVolume * (1 - progress));
+      if (progress >= 1) {
+        finish();
+        return;
+      }
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    rafId = window.requestAnimationFrame(tick);
+    fallbackTimeout = window.setTimeout(finish, durationMs + 25);
+  }, []);
+
+  const unlockStandbyDeck = useCallback(() => {
+    const standbyIdx = getStandbyDeckIndex();
+    const standby = getDeckAudio(standbyIdx);
+    if (!standby || unlockedDecksRef.current[standbyIdx]) return;
+    if (standbyCuedRef.current || standby.getAttribute("src")) return;
+
+    standby.muted = true;
+    standby.src = SILENT_WAV_DATA_URI;
+    void standby.play()
+      .then(() => {
+        if (!standbyCuedRef.current && standby.src === SILENT_WAV_DATA_URI) {
+          standby.pause();
+          standby.currentTime = 0;
+          standby.removeAttribute("src");
+          standby.load();
+          standby.muted = isMutedRef.current;
+          standby.volume = isMutedRef.current ? 0 : volumeRef.current;
+        }
+        unlockedDecksRef.current[standbyIdx] = true;
+      })
+      .catch(() => {
+        if (!standbyCuedRef.current && standby.src === SILENT_WAV_DATA_URI) {
+          standby.removeAttribute("src");
+          standby.load();
+          standby.muted = isMutedRef.current;
+          standby.volume = isMutedRef.current ? 0 : volumeRef.current;
+        }
+      });
+  }, [getDeckAudio, getStandbyDeckIndex]);
+
+  const attachActiveStartSeek = useCallback((
+    audio: HTMLAudioElement,
+    expectedSrc: string,
+    trimStart: number,
+    switchId: number,
+  ) => {
+    activeStartSeekCleanupRef.current?.();
+    if (trimStart <= 0) return;
+
+    const applyStartSeek = () => {
+      if (
+        trackSwitchIdRef.current !== switchId ||
+        audio !== getActiveAudio() ||
+        audio.src !== expectedSrc
+      ) {
+        return;
+      }
+      if (Math.abs(audio.currentTime - trimStart) > 0.05) {
+        try {
+          audio.currentTime = trimStart;
+          setCurrentTime(trimStart);
+        } catch {
+          // Ignore if seek cannot be applied yet
+        }
+      }
+      setSchedulerNonce((n) => n + 1);
+    };
+
+    if (audio.readyState >= 1) {
+      applyStartSeek();
+      return;
+    }
+
+    const handleLoadedMetadata = () => {
+      cleanup();
+      applyStartSeek();
+    };
+
+    const cleanup = () => {
+      audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      if (activeStartSeekCleanupRef.current === cleanup) {
+        activeStartSeekCleanupRef.current = null;
+      }
+    };
+
+    activeStartSeekCleanupRef.current = cleanup;
+    audio.addEventListener("loadedmetadata", handleLoadedMetadata);
+  }, [getActiveAudio]);
+
+  const loadAndPlayOnDeck = useCallback((
+    deck: HTMLAudioElement,
+    track: GalleryItem,
+    expectedSrc: string,
+    trimStart: number,
+    switchId: number,
+  ) => {
+    deck.volume = isMutedRef.current ? 0 : volumeRef.current;
+    deck.muted = isMutedRef.current;
+    if (deck.src !== expectedSrc) {
+      deck.src = track.audioUrl;
+      attachActiveStartSeek(deck, expectedSrc, trimStart, switchId);
+    } else {
+      activeStartSeekCleanupRef.current?.();
+      if (deck.readyState >= 1) {
+        deck.currentTime = trimStart;
+      } else {
+        attachActiveStartSeek(deck, expectedSrc, trimStart, switchId);
+      }
+    }
+    setCurrentTime(trimStart);
+    setDuration(
+      Number.isFinite(deck.duration) && deck.duration > 0
+        ? deck.duration
+        : (track.durationSeconds ?? 0),
+    );
+    setSchedulerNonce((n) => n + 1);
+    void deck.play()
+      .then(() => {
+        if (trackSwitchIdRef.current === switchId) {
+          unlockedDecksRef.current[activeDeckIndexRef.current] = true;
+        }
+      })
+      .catch(() => {
+        if (trackSwitchIdRef.current === switchId) {
+          setIsPlaying(false);
+        }
+      });
+  }, [attachActiveStartSeek]);
+
+  const swapToStandbyDeck = useCallback((
+    track: GalleryItem,
+    expectedSrc: string,
+    trimStart: number,
+    gapless: boolean,
+    switchId: number,
+  ) => {
+    const previousActiveIdx = activeDeckIndexRef.current;
+    const previousActive = getDeckAudio(previousActiveIdx);
+    const standbyIdx: 0 | 1 = previousActiveIdx === 0 ? 1 : 0;
+    const standby = getDeckAudio(standbyIdx);
+    if (!standby) return false;
+
+    const targetVolume = isMutedRef.current ? 0 : volumeRef.current;
+    standby.volume = targetVolume;
+    standby.muted = isMutedRef.current;
+    if (Math.abs(standby.currentTime - trimStart) > 0.08) {
+      standby.currentTime = trimStart;
+    }
+
+    const playPromise = standby.play();
+    activeDeckIndexRef.current = standbyIdx;
+    standbyCuedRef.current = null;
+    hasTransitionedRef.current = false;
+
+    fadeOutAndPauseDeck(previousActive, gapless ? 35 : 0);
+
+    const initialTime = standby.currentTime >= trimStart - 0.08 ? standby.currentTime : trimStart;
+    const initialDuration =
+      Number.isFinite(standby.duration) && standby.duration > 0
+        ? standby.duration
+        : (track.durationSeconds ?? 0);
+    setCurrentTime(initialTime);
+    setDuration(initialDuration);
+    setIsPlaying(true);
+    setSchedulerNonce((n) => n + 1);
+
+    void playPromise
+      .then(() => {
+        if (trackSwitchIdRef.current === switchId) {
+          unlockedDecksRef.current[standbyIdx] = true;
+        }
+      })
+      .catch(() => {
+        if (trackSwitchIdRef.current !== switchId) return;
+        outgoingFadeCleanupRef.current?.();
+        activeDeckIndexRef.current = previousActiveIdx;
+        if (!previousActive) {
+          setIsPlaying(false);
+          return;
+        }
+        loadAndPlayOnDeck(previousActive, track, expectedSrc, trimStart, switchId);
+      });
+
+    return true;
+  }, [fadeOutAndPauseDeck, getDeckAudio, loadAndPlayOnDeck]);
 
   const resetDetailButtonsVisibility = useCallback(() => {
     setAreDetailButtonsVisible(true);
@@ -1356,7 +1614,8 @@ export function HVLScreen() {
     setIsAgeGateOpen(false);
     setHasConfirmedAge(true);
     window.localStorage.setItem(ageConfirmationStorageKey, "true");
-  }, []);
+    unlockStandbyDeck();
+  }, [unlockStandbyDeck]);
 
   const onPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragState.current;
@@ -1513,15 +1772,20 @@ export function HVLScreen() {
   const previousTrackResult = selectedProject ? getPreviousTrack(selectedProject.index, displayMode) : null;
   const nextTrack = nextTrackResult?.track ?? null;
   const isStreaming = selectedTrack?.type === "stream" && !selectedTrack.audioUrl;
-  const playbackProgress = duration > 0 ? Math.min((currentTime / duration) * 100, 100) : 0;
+  const selectedTrackTrim = getTrackAudioTrim(selectedTrack?.audioUrl);
+  const rawTrackDuration = duration > 0 ? duration : (selectedTrack?.durationSeconds ?? 0);
+  const trackBounds = getEffectiveTrackBounds(rawTrackDuration, selectedTrackTrim);
+  const effectiveStart = trackBounds.start;
+  const effectiveEnd = trackBounds.end;
+  const effectiveDuration = trackBounds.duration;
+  const displayCurrentTime = Math.max(0, Math.min(currentTime - effectiveStart, effectiveDuration));
+  const playbackProgress = effectiveDuration > 0 ? Math.min((displayCurrentTime / effectiveDuration) * 100, 100) : 0;
   const isAutoNextEnabled =
     showOverlay && isStreaming && Boolean(selectedProject);
   const detailDuration = isStreaming
     ? streamDisplayDelay
-    : duration > 0
-      ? duration
-      : selectedTrack?.durationSeconds ?? 0;
-  const detailCurrentTime = isStreaming ? streamElapsedTime : currentTime;
+    : effectiveDuration;
+  const detailCurrentTime = isStreaming ? streamElapsedTime : displayCurrentTime;
   const streamPlaybackProgress = streamDisplayDelay > 0
     ? Math.min(Math.max((streamElapsedTime / streamDisplayDelay) * 100, 0), 100)
     : 0;
@@ -1533,12 +1797,10 @@ export function HVLScreen() {
   const isDetailPlaying = isStreaming ? !isAutoNextPaused : isPlaying;
   const dockDuration = isStreaming
     ? streamDisplayDelay
-    : duration > 0
-      ? duration
-      : selectedTrack?.durationSeconds ?? 0;
+    : effectiveDuration;
   const dockCurrentTime = isStreaming
     ? streamElapsedTime
-    : currentTime;
+    : displayCurrentTime;
   const dockPlaybackProgress = isStreaming
     ? streamPlaybackProgress
     : dockDuration > 0
@@ -1565,6 +1827,7 @@ export function HVLScreen() {
       textureIndex: number,
       presentation?: TrackPresentation,
       keepLyricsOpen = false,
+      transitionOptions?: { gapless?: boolean; fromUserGesture?: boolean },
     ) => {
       if (closeOverlayTimeoutRef.current != null) {
         window.clearTimeout(closeOverlayTimeoutRef.current);
@@ -1574,32 +1837,80 @@ export function HVLScreen() {
       // audio element for another track. Mobile WebKit can otherwise deliver
       // the old seek callbacks after the source has already changed.
       pendingAudioSeekCleanupRef.current?.();
+      activeStartSeekCleanupRef.current?.();
+      if (standbyCueTimeoutRef.current != null) {
+        window.clearTimeout(standbyCueTimeoutRef.current);
+        standbyCueTimeoutRef.current = null;
+      }
+      if (transitionTimerRef.current != null) {
+        window.clearTimeout(transitionTimerRef.current);
+        transitionTimerRef.current = null;
+      }
+      if (transitionRafRef.current != null) {
+        window.cancelAnimationFrame(transitionRafRef.current);
+        transitionRafRef.current = null;
+      }
       audioSeekRequestRef.current += 1;
+      const switchId = ++trackSwitchIdRef.current;
       isSeekingRef.current = false;
       resumeAfterSeekRef.current = false;
       hasTransitionedRef.current = false;
-      const audio = audioRef.current;
       const track = galleryItems[textureIndex];
       const isTrackStreamPreview = track?.type === "stream" && !track.audioUrl;
-      if (audio) {
-        if (track?.audioUrl) {
-          const expectedSrc = new URL(track.audioUrl, window.location.href).href;
-          if (audio.src !== expectedSrc) {
-            audio.src = track.audioUrl;
-          }
-          audio.currentTime = 0;
-        } else {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.removeAttribute("src");
-          audio.load();
+      const trim = getTrackAudioTrim(track?.audioUrl);
+      let handledWithStandby = false;
+
+      if (track?.audioUrl) {
+        const expectedSrc = new URL(track.audioUrl, window.location.href).href;
+        const standby = getStandbyAudio();
+        const canUseStandby = Boolean(
+          standby &&
+          standby.src === expectedSrc &&
+          standby.readyState >= 2 &&
+          !standby.seeking,
+        );
+
+        if (canUseStandby) {
+          handledWithStandby = swapToStandbyDeck(
+            track,
+            expectedSrc,
+            trim.start,
+            Boolean(transitionOptions?.gapless),
+            switchId,
+          );
         }
-      }
-      if (!track?.audioUrl) {
+
+        if (!handledWithStandby) {
+          outgoingFadeCleanupRef.current?.();
+          if (standby && !standby.paused) {
+            standby.pause();
+          }
+          const active = getActiveAudio();
+          if (active) {
+            loadAndPlayOnDeck(active, track, expectedSrc, trim.start, switchId);
+            if (transitionOptions?.fromUserGesture !== false) {
+              unlockStandbyDeck();
+            }
+          } else {
+            setCurrentTime(trim.start);
+            setDuration(track.durationSeconds ?? 0);
+          }
+        }
+      } else {
+        outgoingFadeCleanupRef.current?.();
+        [deckARef.current, deckBRef.current].forEach((deck) => {
+          if (!deck) return;
+          deck.pause();
+          deck.currentTime = 0;
+          deck.removeAttribute("src");
+          deck.load();
+        });
+        standbyCuedRef.current = null;
         setIsPlaying(false);
+        setCurrentTime(0);
+        setDuration(track?.durationSeconds ?? 0);
       }
-      setCurrentTime(0);
-      setDuration(track?.durationSeconds ?? 0);
+
       setAutoNextRemaining(streamDisplayDelay);
       setStreamElapsedTime(0);
       setStreamTimerRevision((revision) => revision + 1);
@@ -1647,21 +1958,29 @@ export function HVLScreen() {
       }
       setSelectedProject({ name: projectName, imageUrl, index: textureIndex });
       setShowOverlay(true);
-      if (track?.audioUrl && audio) {
-        audio.volume = isMutedRef.current ? 0 : volumeRef.current;
-        audio.muted = isMutedRef.current;
-        void audio.play().catch(() => setIsPlaying(false));
-      }
       if (isMobile) {
         resetDetailButtonsVisibility();
       } else {
         resetDetailButtonsVisibility();
       }
     },
-    [isDockPinned, isMobile, resetDetailButtonsVisibility, streamDisplayDelay],
+    [
+      getActiveAudio,
+      getStandbyAudio,
+      isDockPinned,
+      isMobile,
+      loadAndPlayOnDeck,
+      resetDetailButtonsVisibility,
+      streamDisplayDelay,
+      swapToStandbyDeck,
+      unlockStandbyDeck,
+    ],
   );
 
-  const handleNextTrack = useCallback((presentation?: TrackPresentation) => {
+  const handleNextTrack = useCallback((
+    presentation?: TrackPresentation,
+    transitionOptions?: { gapless?: boolean; fromUserGesture?: boolean },
+  ) => {
     if (!nextTrackResult) return;
 
     const nextPresentation = presentation ?? (isDetailMinimizedRef.current ? "minimized" : "detail");
@@ -1672,6 +1991,7 @@ export function HVLScreen() {
       nextTrackResult.index,
       nextPresentation,
       isLyricsOpen && nextPresentation === "detail",
+      transitionOptions,
     );
   }, [handleImageClick, isLyricsOpen, nextTrackResult]);
 
@@ -1688,26 +2008,119 @@ export function HVLScreen() {
   }, [handleImageClick, isLyricsOpen, previousTrackResult]);
 
   useEffect(() => {
-    handleNextTrackRef.current = handleNextTrack;
+    handleNextTrackRef.current = () => handleNextTrack(undefined, { fromUserGesture: false });
   }, [handleNextTrack]);
 
   useEffect(() => {
-    if (!nextTrackResult?.track?.audioUrl) return;
-    const nextUrl = nextTrackResult.track.audioUrl;
+    const isRepeatActive = repeatMode === "one" || repeatMode === "all";
+    const cueUrl = isRepeatActive
+      ? selectedTrack?.audioUrl
+      : nextTrackResult?.track?.audioUrl;
 
-    const preloader = new Audio();
-    preloader.preload = "auto";
-    preloader.src = nextUrl;
-    preloader.volume = isMuted ? 0 : volume;
-    preloader.muted = isMuted;
-    preloader.load();
-    preloadAudioRef.current = preloader;
+    if (!cueUrl) {
+      standbyCuedRef.current = null;
+      return;
+    }
+
+    const expectedCueSrc = new URL(cueUrl, window.location.href).href;
+    const standby = getStandbyAudio();
+    if (!standby) return;
+
+    if (
+      standby.src === expectedCueSrc &&
+      standbyCuedRef.current?.expectedSrc === expectedCueSrc
+    ) {
+      return;
+    }
+
+    let cleanupCueListeners: (() => void) | null = null;
+    standbyCueTimeoutRef.current = window.setTimeout(() => {
+      standbyCueTimeoutRef.current = null;
+      const currentStandby = getStandbyAudio();
+      if (!currentStandby) return;
+
+      const cueTrim = getTrackAudioTrim(cueUrl);
+      const cueStart = cueTrim.start;
+
+      standbyCuedRef.current = {
+        expectedSrc: expectedCueSrc,
+        trimStart: cueStart,
+        ready: false,
+      };
+
+      const syncCueSeekAndReady = () => {
+        if (currentStandby.src !== expectedCueSrc) return;
+        if (
+          cueStart > 0 &&
+          currentStandby.readyState >= 1 &&
+          Math.abs(currentStandby.currentTime - cueStart) > 0.05
+        ) {
+          try {
+            currentStandby.currentTime = cueStart;
+          } catch {
+            // Ignore if media element cannot seek yet
+          }
+        }
+        if (
+          currentStandby.readyState >= 3 &&
+          standbyCuedRef.current?.expectedSrc === expectedCueSrc
+        ) {
+          standbyCuedRef.current.ready = true;
+        }
+      };
+
+      const handleLoadedMetadata = () => syncCueSeekAndReady();
+      const handleCanPlay = () => {
+        if (
+          currentStandby.src === expectedCueSrc &&
+          standbyCuedRef.current?.expectedSrc === expectedCueSrc
+        ) {
+          standbyCuedRef.current.ready = true;
+        }
+      };
+
+      currentStandby.addEventListener("loadedmetadata", handleLoadedMetadata);
+      currentStandby.addEventListener("canplay", handleCanPlay);
+      cleanupCueListeners = () => {
+        currentStandby.removeEventListener("loadedmetadata", handleLoadedMetadata);
+        currentStandby.removeEventListener("canplay", handleCanPlay);
+      };
+
+      currentStandby.preload = "auto";
+      currentStandby.muted = isMutedRef.current;
+      currentStandby.volume = isMutedRef.current ? 0 : volumeRef.current;
+
+      if (currentStandby.src !== expectedCueSrc) {
+        currentStandby.pause();
+        currentStandby.src = cueUrl;
+        currentStandby.load();
+      } else {
+        syncCueSeekAndReady();
+      }
+    }, 80);
 
     return () => {
-      preloader.src = "";
-      preloadAudioRef.current = null;
+      if (standbyCueTimeoutRef.current != null) {
+        window.clearTimeout(standbyCueTimeoutRef.current);
+        standbyCueTimeoutRef.current = null;
+      }
+      cleanupCueListeners?.();
     };
-  }, [nextTrackResult?.track?.audioUrl, volume, isMuted]);
+  }, [
+    getStandbyAudio,
+    nextTrackResult?.track?.audioUrl,
+    repeatMode,
+    selectedProject?.index,
+    selectedTrack?.audioUrl,
+  ]);
+
+  const syncDecksAudioLevel = useCallback((nextVolume: number, nextMuted: boolean) => {
+    [deckARef.current, deckBRef.current].forEach((deck) => {
+      if (!deck || deck === fadingDeckRef.current) return;
+      deck.volume = nextMuted ? 0 : nextVolume;
+      deck.muted = nextMuted;
+    });
+  }, []);
 
   const handleVolumeChange = useCallback((newVolume: number) => {
     const clamped = Math.max(0, Math.min(1, newVolume));
@@ -1721,15 +2134,8 @@ export function HVLScreen() {
     }
     window.localStorage.setItem(volumeStorageKey, clamped.toString());
 
-    if (audioRef.current) {
-      audioRef.current.volume = clamped;
-      audioRef.current.muted = clamped === 0;
-    }
-    if (preloadAudioRef.current) {
-      preloadAudioRef.current.volume = clamped;
-      preloadAudioRef.current.muted = clamped === 0;
-    }
-  }, []);
+    syncDecksAudioLevel(clamped, clamped === 0);
+  }, [syncDecksAudioLevel]);
 
   const handleToggleMute = useCallback(() => {
     if (isMuted || volume === 0) {
@@ -1740,27 +2146,15 @@ export function HVLScreen() {
       volumeRef.current = restored;
       window.localStorage.setItem(mutedStorageKey, "false");
       window.localStorage.setItem(volumeStorageKey, restored.toString());
-      if (audioRef.current) {
-        audioRef.current.muted = false;
-        audioRef.current.volume = restored;
-      }
-      if (preloadAudioRef.current) {
-        preloadAudioRef.current.muted = false;
-        preloadAudioRef.current.volume = restored;
-      }
+      syncDecksAudioLevel(restored, false);
     } else {
       lastNonZeroVolumeRef.current = volume > 0 ? volume : 0.85;
       setIsMuted(true);
       isMutedRef.current = true;
       window.localStorage.setItem(mutedStorageKey, "true");
-      if (audioRef.current) {
-        audioRef.current.muted = true;
-      }
-      if (preloadAudioRef.current) {
-        preloadAudioRef.current.muted = true;
-      }
+      syncDecksAudioLevel(volume, true);
     }
-  }, [isMuted, volume]);
+  }, [isMuted, syncDecksAudioLevel, volume]);
 
   const handleNextButtonClick = useCallback((presentation?: TrackPresentation) => {
     playClickSound();
@@ -1802,7 +2196,7 @@ export function HVLScreen() {
 
   const handleAutoNextPauseToggle = useCallback(() => {
     playClickSound();
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (isAutoNextPaused) {
       autoNextDeadlineRef.current = performance.now() + Math.max(0, streamDisplayDelay - streamElapsedTime) * 1_000;
       setIsAutoNextPaused(false);
@@ -1824,7 +2218,7 @@ export function HVLScreen() {
     if (selectedTrack?.audioUrl && audio) {
       audio.pause();
     }
-  }, [isAutoNextPaused, selectedTrack?.audioUrl, streamDisplayDelay, streamElapsedTime]);
+  }, [getActiveAudio, isAutoNextPaused, selectedTrack?.audioUrl, streamDisplayDelay, streamElapsedTime]);
 
   const handleMinimizeProject = useCallback(() => {
     playClickSound();
@@ -1956,46 +2350,176 @@ export function HVLScreen() {
   }, [isAutoNextEnabled, isAutoNextPaused, nextTrackResult?.index, selectedProject?.index, streamDisplayDelay, streamTimerRevision]);
 
   const handleTrackEnded = useCallback(() => {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     // iOS/iPadOS can emit a stale `ended` event while a seek is settling.
     // That event is not a real track completion and must not advance the
     // playlist.
-    if (isSeekingRef.current || pendingAudioSeekCleanupRef.current || audio?.seeking) return;
-
-    // Ignore an `ended` event queued for the previous source while the shared
-    // audio element is being switched to the next track.
-    if (audio?.currentSrc && selectedTrack?.audioUrl) {
-      const expectedSrc = new URL(selectedTrack.audioUrl, window.location.href).href;
-      if (audio.currentSrc !== expectedSrc) return;
+    if (isSeekingRef.current || pendingAudioSeekCleanupRef.current || audio?.seeking) {
+      hasTransitionedRef.current = false;
+      return;
     }
 
-    if (repeatMode === "all" || repeatMode === "one") {
-      if (!audio) return;
+    const currentTrack = selectedTrackRef.current;
+    // Ignore an `ended` event queued for the previous source while the shared
+    // audio element is being switched to the next track.
+    if (audio?.currentSrc && currentTrack?.audioUrl) {
+      const expectedSrc = new URL(currentTrack.audioUrl, window.location.href).href;
+      if (audio.currentSrc !== expectedSrc) {
+        hasTransitionedRef.current = false;
+        return;
+      }
+    }
+
+    const currentRepeatMode = repeatModeRef.current;
+    if (currentRepeatMode === "all" || currentRepeatMode === "one") {
+      if (!audio || !currentTrack?.audioUrl) return;
 
       // "all" is the UI's single-repeat mode: consume it after replaying once.
-      if (repeatMode === "all") {
+      if (currentRepeatMode === "all") {
         setRepeatMode("off");
       }
 
-      audio.currentTime = 0;
+      const trim = getTrackAudioTrim(currentTrack.audioUrl);
+      const expectedSrc = new URL(currentTrack.audioUrl, window.location.href).href;
+      const standby = getStandbyAudio();
+      const canUseStandby = Boolean(
+        standby &&
+        standby.src === expectedSrc &&
+        standby.readyState >= 2 &&
+        !standby.seeking,
+      );
+
+      if (canUseStandby) {
+        const switchId = ++trackSwitchIdRef.current;
+        swapToStandbyDeck(currentTrack, expectedSrc, trim.start, true, switchId);
+        return;
+      }
+
+      audio.currentTime = trim.start;
       hasTransitionedRef.current = false;
+      setCurrentTime(trim.start);
+      setSchedulerNonce((n) => n + 1);
       void audio.play().catch(() => setIsPlaying(false));
       return;
     }
 
     hasTransitionedRef.current = false;
-    handleNextTrack();
-  }, [handleNextTrack, repeatMode, selectedTrack]);
+    handleNextTrack(undefined, { gapless: true, fromUserGesture: false });
+  }, [getActiveAudio, getStandbyAudio, handleNextTrack, swapToStandbyDeck]);
+
+  useEffect(() => {
+    selectedTrackRef.current = selectedTrack;
+    repeatModeRef.current = repeatMode;
+    handleTrackEndedRef.current = handleTrackEnded;
+  }, [handleTrackEnded, repeatMode, selectedTrack]);
+
+  useEffect(() => {
+    if (!isPlaying || !selectedTrack?.audioUrl) return;
+
+    let cancelled = false;
+    const expectedSrc = new URL(selectedTrack.audioUrl, window.location.href).href;
+    const trim = getTrackAudioTrim(selectedTrack.audioUrl);
+    const fallbackRawDuration = duration > 0 ? duration : (selectedTrack.durationSeconds ?? 0);
+
+    const clearScheduledChecks = () => {
+      if (transitionTimerRef.current != null) {
+        window.clearTimeout(transitionTimerRef.current);
+        transitionTimerRef.current = null;
+      }
+      if (transitionRafRef.current != null) {
+        window.cancelAnimationFrame(transitionRafRef.current);
+        transitionRafRef.current = null;
+      }
+    };
+
+    const checkAndSchedule = () => {
+      clearScheduledChecks();
+      if (cancelled) return;
+
+      const activeAudio = getActiveAudio();
+      if (
+        !activeAudio ||
+        activeAudio.paused ||
+        activeAudio.seeking ||
+        isSeekingRef.current ||
+        hasTransitionedRef.current
+      ) {
+        return;
+      }
+
+      if (activeAudio.currentSrc && activeAudio.currentSrc !== expectedSrc) {
+        return;
+      }
+
+      const rawDur =
+        Number.isFinite(activeAudio.duration) && activeAudio.duration > 0
+          ? activeAudio.duration
+          : fallbackRawDuration;
+      if (rawDur <= 0) return;
+
+      const bounds = getEffectiveTrackBounds(rawDur, trim);
+      if (bounds.end <= bounds.start + 0.1) return;
+
+      const remainingSeconds = bounds.triggerTime - activeAudio.currentTime;
+      if (remainingSeconds <= 0.008) {
+        hasTransitionedRef.current = true;
+        handleTrackEndedRef.current();
+        return;
+      }
+
+      const playbackRate = activeAudio.playbackRate > 0 ? activeAudio.playbackRate : 1;
+      const remainingMs = (remainingSeconds / playbackRate) * 1000;
+
+      if (remainingMs > 450) {
+        transitionTimerRef.current = window.setTimeout(
+          checkAndSchedule,
+          Math.max(50, remainingMs - 300),
+        );
+        return;
+      }
+
+      transitionTimerRef.current = window.setTimeout(
+        checkAndSchedule,
+        Math.max(8, Math.min(remainingMs, 35)),
+      );
+      if (document.visibilityState === "visible") {
+        transitionRafRef.current = window.requestAnimationFrame(checkAndSchedule);
+      }
+    };
+
+    checkAndSchedule();
+    return () => {
+      cancelled = true;
+      clearScheduledChecks();
+    };
+  }, [
+    duration,
+    getActiveAudio,
+    isPlaying,
+    repeatMode,
+    schedulerNonce,
+    selectedProject?.index,
+    selectedTrack?.audioUrl,
+    selectedTrack?.durationSeconds,
+  ]);
 
   const handleTimeUpdate = useCallback((event: React.SyntheticEvent<HTMLAudioElement>) => {
+    if (event.currentTarget !== getActiveAudio()) return;
     const currentAudio = event.currentTarget;
     setCurrentTime(currentAudio.currentTime);
 
-    // Smooth gapless auto-transition: when reaching near the end of track (within 0.12s of duration)
-    // and actively playing without seeking, transition immediately without waiting for empty buffer delay
+    const currentTrack = selectedTrackRef.current;
+    const trim = getTrackAudioTrim(currentTrack?.audioUrl);
+    const rawDur =
+      Number.isFinite(currentAudio.duration) && currentAudio.duration > 0
+        ? currentAudio.duration
+        : (currentTrack?.durationSeconds ?? 0);
+    if (rawDur <= 0) return;
+
+    const bounds = getEffectiveTrackBounds(rawDur, trim);
     if (
-      currentAudio.duration > 0 &&
-      currentAudio.currentTime >= currentAudio.duration - 0.12 &&
+      bounds.end > bounds.start + 0.1 &&
+      currentAudio.currentTime >= bounds.triggerTime &&
       !currentAudio.paused &&
       !currentAudio.seeking &&
       !isSeekingRef.current &&
@@ -2004,13 +2528,14 @@ export function HVLScreen() {
       hasTransitionedRef.current = true;
       handleTrackEnded();
     }
-  }, [handleTrackEnded]);
+  }, [getActiveAudio, handleTrackEnded]);
 
   const handlePlayPause = useCallback(async () => {
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (!audio || !selectedTrack?.audioUrl) return;
 
     if (audio.paused) {
+      unlockStandbyDeck();
       try {
         await audio.play();
       } catch {
@@ -2020,7 +2545,7 @@ export function HVLScreen() {
     }
 
     audio.pause();
-  }, [selectedTrack]);
+  }, [getActiveAudio, selectedTrack, unlockStandbyDeck]);
 
   const handlePlayPauseButtonClick = useCallback(() => {
     playClickSound();
@@ -2048,13 +2573,15 @@ export function HVLScreen() {
 
   const getProgressSeekTime = useCallback(
     (element: HTMLDivElement, clientX: number) => {
-      if (!duration) return null;
+      if (effectiveDuration <= 0) return null;
 
       const bounds = element.getBoundingClientRect();
+      if (bounds.width <= 0) return null;
       const progress = Math.min(Math.max((clientX - bounds.left) / bounds.width, 0), 1);
-      return progress * duration;
+      const maxSeekTime = Math.max(effectiveStart, effectiveEnd - 0.08);
+      return effectiveStart + progress * (maxSeekTime - effectiveStart);
     },
-    [duration],
+    [effectiveDuration, effectiveEnd, effectiveStart],
   );
 
   const previewAudioSeek = useCallback((nextTime: number) => {
@@ -2065,9 +2592,13 @@ export function HVLScreen() {
     pendingAudioSeekCleanupRef.current?.();
     const requestId = audioSeekRequestRef.current + 1;
     audioSeekRequestRef.current = requestId;
-    const targetTime = Math.min(Math.max(nextTime, 0), Number.isFinite(audio.duration) ? audio.duration : nextTime);
+    const maxAllowedTime =
+      Number.isFinite(audio.duration) && audio.duration > 0
+        ? Math.min(audio.duration, effectiveEnd > 0 ? effectiveEnd : audio.duration)
+        : nextTime;
+    const targetTime = Math.min(Math.max(nextTime, 0), maxAllowedTime);
     const warmupDuration = 0.6;
-    const shouldWarmUp = shouldResume && targetTime > warmupDuration;
+    const shouldWarmUp = shouldResume && targetTime > effectiveStart + warmupDuration;
     const seekStartTime = shouldWarmUp ? targetTime - warmupDuration : targetTime;
     let fallbackTimeout: number | null = null;
     let warmupAnimationFrame: number | null = null;
@@ -2093,7 +2624,9 @@ export function HVLScreen() {
     const settleAtCurrentPosition = () => {
       hasSettled = true;
       cleanUp();
+      hasTransitionedRef.current = false;
       setCurrentTime(audio.currentTime);
+      setSchedulerNonce((n) => n + 1);
     };
 
     const finishWarmup = () => {
@@ -2133,6 +2666,7 @@ export function HVLScreen() {
           restorePlayback = null;
           hasSettled = true;
           cleanUp();
+          hasTransitionedRef.current = false;
           setCurrentTime(audio.currentTime);
           setIsPlaying(false);
         });
@@ -2167,11 +2701,11 @@ export function HVLScreen() {
 
     // Some engines do not emit `seeked` when the requested time equals the current frame.
     fallbackTimeout = window.setTimeout(finishSeek, 500);
-  }, []);
+  }, [effectiveEnd, effectiveStart]);
 
   const handleLyricsLineClick = useCallback(
     (startTime: number | null) => {
-      const audio = audioRef.current;
+      const audio = getActiveAudio();
       if (!audio || startTime == null || selectedTrack?.type !== "pulled" || !selectedTrack.audioUrl) return;
 
       // Keep the seek and play inside the original touch/click task. iOS
@@ -2180,12 +2714,23 @@ export function HVLScreen() {
       audioSeekRequestRef.current += 1;
       isSeekingRef.current = false;
       resumeAfterSeekRef.current = false;
+      hasTransitionedRef.current = false;
       setIsSeeking(false);
-      audio.currentTime = startTime;
-      setCurrentTime(startTime);
+      const boundedTime =
+        effectiveEnd > 0
+          ? Math.min(startTime, Math.max(effectiveStart, effectiveEnd - 0.08))
+          : startTime;
+      const targetTime =
+        boundedTime < effectiveStart && boundedTime <= 0.6
+          ? effectiveStart
+          : boundedTime;
+      audio.currentTime = targetTime;
+      setCurrentTime(targetTime);
+      setSchedulerNonce((n) => n + 1);
+      unlockStandbyDeck();
       void audio.play().catch(() => setIsPlaying(false));
     },
-    [selectedTrack],
+    [effectiveEnd, effectiveStart, getActiveAudio, selectedTrack, unlockStandbyDeck],
   );
 
   const handleLyricsLineKeyDown = useCallback(
@@ -2201,8 +2746,8 @@ export function HVLScreen() {
   const handleProgressPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       event.stopPropagation();
-      const audio = audioRef.current;
-      if (!audio || !duration) return;
+      const audio = getActiveAudio();
+      if (!audio || effectiveDuration <= 0) return;
 
       audioSeekRequestRef.current += 1;
       isSeekingRef.current = true;
@@ -2213,7 +2758,7 @@ export function HVLScreen() {
       const nextTime = getProgressSeekTime(event.currentTarget, event.clientX);
       if (nextTime != null) previewAudioSeek(nextTime);
     },
-    [duration, getProgressSeekTime, previewAudioSeek],
+    [effectiveDuration, getActiveAudio, getProgressSeekTime, previewAudioSeek],
   );
 
   const handleProgressPointerMove = useCallback(
@@ -2232,7 +2777,7 @@ export function HVLScreen() {
     const nextTime = getProgressSeekTime(event.currentTarget, event.clientX);
     isSeekingRef.current = false;
     setIsSeeking(false);
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (audio && nextTime != null) {
       completeAudioSeek(audio, nextTime, resumeAfterSeekRef.current);
     }
@@ -2240,13 +2785,13 @@ export function HVLScreen() {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-  }, [completeAudioSeek, getProgressSeekTime]);
+  }, [completeAudioSeek, getActiveAudio, getProgressSeekTime]);
 
   const cancelProgressSeek = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     event.stopPropagation();
     isSeekingRef.current = false;
     setIsSeeking(false);
-    const audio = audioRef.current;
+    const audio = getActiveAudio();
     if (audio) {
       completeAudioSeek(audio, audio.currentTime, resumeAfterSeekRef.current);
     }
@@ -2254,7 +2799,7 @@ export function HVLScreen() {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-  }, [completeAudioSeek]);
+  }, [completeAudioSeek, getActiveAudio]);
 
   useEffect(() => {
     const media = window.matchMedia(mobileMediaQuery);
@@ -2335,11 +2880,8 @@ export function HVLScreen() {
     setIsMuted(initialMuted);
     isMutedRef.current = initialMuted;
 
-    if (audioRef.current) {
-      audioRef.current.volume = initialMuted ? 0 : initialVolume;
-      audioRef.current.muted = initialMuted;
-    }
-  }, []);
+    syncDecksAudioLevel(initialVolume, initialMuted);
+  }, [syncDecksAudioLevel]);
 
   useEffect(() => {
     if (!isSettingsOpen) return;
@@ -2469,6 +3011,14 @@ export function HVLScreen() {
       if (songAnnotationClosingTimeoutRef.current != null) window.clearTimeout(songAnnotationClosingTimeoutRef.current);
       if (pendingLyricsOpenFrameRef.current != null) window.cancelAnimationFrame(pendingLyricsOpenFrameRef.current);
       if (pendingSongAnnotationOpenFrameRef.current != null) window.cancelAnimationFrame(pendingSongAnnotationOpenFrameRef.current);
+      if (standbyCueTimeoutRef.current != null) window.clearTimeout(standbyCueTimeoutRef.current);
+      if (transitionTimerRef.current != null) window.clearTimeout(transitionTimerRef.current);
+      if (transitionRafRef.current != null) window.cancelAnimationFrame(transitionRafRef.current);
+      pendingAudioSeekCleanupRef.current?.();
+      activeStartSeekCleanupRef.current?.();
+      outgoingFadeCleanupRef.current?.();
+      deckARef.current?.pause();
+      deckBRef.current?.pause();
       clearFloatingPlayerHideTimeout();
     };
   }, [clearFloatingPlayerHideTimeout]);
@@ -2506,29 +3056,47 @@ export function HVLScreen() {
     const canControlAudio = selectedTrack.type === "pulled";
     mediaSession.playbackState = canControlAudio ? (isPlaying ? "playing" : "paused") : "none";
 
-    setAction("play", canControlAudio ? () => void audioRef.current?.play() : null);
-    setAction("pause", canControlAudio ? () => audioRef.current?.pause() : null);
+    setAction("play", canControlAudio ? () => void getActiveAudio()?.play() : null);
+    setAction("pause", canControlAudio ? () => getActiveAudio()?.pause() : null);
     setAction("nexttrack", () => handleNextTrack());
     setAction("seekbackward", canControlAudio ? (details) => {
-      const audio = audioRef.current;
+      const audio = getActiveAudio();
       if (!audio) return;
-      const nextTime = Math.max(0, audio.currentTime - (details.seekOffset ?? 10));
+      const trim = getTrackAudioTrim(selectedTrack.audioUrl);
+      const rawDur =
+        Number.isFinite(audio.duration) && audio.duration > 0
+          ? audio.duration
+          : (selectedTrack.durationSeconds ?? 0);
+      const bounds = getEffectiveTrackBounds(rawDur, trim);
+      const nextTime = Math.max(bounds.start, audio.currentTime - (details.seekOffset ?? 10));
       audio.currentTime = nextTime;
+      hasTransitionedRef.current = false;
       setCurrentTime(nextTime);
+      setSchedulerNonce((n) => n + 1);
     } : null);
     setAction("seekforward", canControlAudio ? (details) => {
-      const audio = audioRef.current;
+      const audio = getActiveAudio();
       if (!audio || !Number.isFinite(audio.duration)) return;
-      const nextTime = Math.min(audio.duration, audio.currentTime + (details.seekOffset ?? 10));
+      const trim = getTrackAudioTrim(selectedTrack.audioUrl);
+      const bounds = getEffectiveTrackBounds(audio.duration, trim);
+      const maxSeek = Math.max(bounds.start, bounds.end - 0.08);
+      const nextTime = Math.min(maxSeek, audio.currentTime + (details.seekOffset ?? 10));
       audio.currentTime = nextTime;
+      hasTransitionedRef.current = false;
       setCurrentTime(nextTime);
+      setSchedulerNonce((n) => n + 1);
     } : null);
     setAction("seekto", canControlAudio ? (details) => {
-      const audio = audioRef.current;
+      const audio = getActiveAudio();
       if (!audio || details.seekTime == null || !Number.isFinite(audio.duration)) return;
-      const nextTime = Math.min(Math.max(details.seekTime, 0), audio.duration);
+      const trim = getTrackAudioTrim(selectedTrack.audioUrl);
+      const bounds = getEffectiveTrackBounds(audio.duration, trim);
+      const maxSeek = Math.max(bounds.start, bounds.end - 0.08);
+      const nextTime = Math.min(Math.max(bounds.start + details.seekTime, bounds.start), maxSeek);
       audio.currentTime = nextTime;
+      hasTransitionedRef.current = false;
       setCurrentTime(nextTime);
+      setSchedulerNonce((n) => n + 1);
     } : null);
 
     return () => {
@@ -2539,21 +3107,21 @@ export function HVLScreen() {
       setAction("seekforward", null);
       setAction("seekto", null);
     };
-  }, [handleNextTrack, isPlaying, selectedTrack]);
+  }, [getActiveAudio, handleNextTrack, isPlaying, selectedTrack]);
 
   useEffect(() => {
-    if (!("mediaSession" in navigator) || !duration || !Number.isFinite(duration)) return;
+    if (!("mediaSession" in navigator) || !effectiveDuration || !Number.isFinite(effectiveDuration)) return;
 
     try {
       navigator.mediaSession.setPositionState({
-        duration,
-        position: Math.min(Math.max(currentTime, 0), duration),
-        playbackRate: audioRef.current?.playbackRate ?? 1,
+        duration: effectiveDuration,
+        position: Math.min(Math.max(displayCurrentTime, 0), effectiveDuration),
+        playbackRate: getActiveAudio()?.playbackRate ?? 1,
       });
     } catch {
       // Position state is optional on some browsers.
     }
-  }, [currentTime, duration]);
+  }, [displayCurrentTime, effectiveDuration, getActiveAudio]);
 
   return (
     <div className="sceneRoot">
@@ -2636,23 +3204,41 @@ export function HVLScreen() {
         </div>
       )}
 
-      <audio
-        ref={audioRef}
-        preload="auto"
-        onLoadedMetadata={(event) => {
-          setDuration(event.currentTarget.duration);
-          event.currentTarget.volume = isMutedRef.current ? 0 : volumeRef.current;
-          event.currentTarget.muted = isMutedRef.current;
-        }}
-        onTimeUpdate={handleTimeUpdate}
-        onSeeked={(event) => {
-          hasTransitionedRef.current = false;
-          setCurrentTime(event.currentTarget.currentTime);
-        }}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-        onEnded={handleTrackEnded}
-      />
+      {[deckARef, deckBRef].map((deckRef, deckIndex) => (
+        <audio
+          key={deckIndex}
+          ref={deckRef}
+          preload="auto"
+          onLoadedMetadata={(event) => {
+            if (event.currentTarget !== getActiveAudio()) return;
+            const audio = event.currentTarget;
+            setDuration(audio.duration);
+            audio.volume = isMutedRef.current ? 0 : volumeRef.current;
+            audio.muted = isMutedRef.current;
+            setSchedulerNonce((n) => n + 1);
+          }}
+          onTimeUpdate={handleTimeUpdate}
+          onSeeked={(event) => {
+            if (event.currentTarget !== getActiveAudio()) return;
+            hasTransitionedRef.current = false;
+            setCurrentTime(event.currentTarget.currentTime);
+            setSchedulerNonce((n) => n + 1);
+          }}
+          onPlay={(event) => {
+            if (event.currentTarget !== getActiveAudio()) return;
+            setIsPlaying(true);
+            setSchedulerNonce((n) => n + 1);
+          }}
+          onPause={(event) => {
+            if (event.currentTarget !== getActiveAudio()) return;
+            setIsPlaying(false);
+          }}
+          onEnded={(event) => {
+            if (event.currentTarget !== getActiveAudio()) return;
+            handleTrackEnded();
+          }}
+        />
+      ))}
       {hasConfirmedAge && !isAgeGateOpen && !selectedProject && (
         <div className={`scene-utility-controls ${areSceneControlsVisible ? "" : "is-hidden"}`}>
           <button
